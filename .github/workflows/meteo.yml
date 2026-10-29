@@ -1,0 +1,146 @@
+name: Open-Meteo cloud + fog grid (14-day) + ECMWF 9 km (Houston, dev)
+
+# Slow feed: Open-Meteo best_match low/mid/high cloud + visibility (fog) over the HRRR box,
+# 1.0 x 1.0 deg, 63 points, ONCE a day (the 08:30 UTC run): Iceland 4608 + North Norway 4838 +
+# South Norway 440 + Houston 63 = 9949 calls/day, under the free 10000.
+# The 20:30 run (and any dispatch after 12 UTC) refreshes only the ECMWF 9 km files from Open-Meteo's
+# open S3 bucket (no API calls), so ECMWF 00Z/12Z stay fresh.
+# A run skips itself if the published grid is < 5 h old, so an extra trigger can't double-spend.
+#
+# Two jobs: the slow paced extraction runs in its own concurrency group so it never blocks
+# the hourly HRRR deploys; only the short deploy job joins the shared "pages" group.
+
+on:
+  schedule:
+    - cron: '30 8,20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run even if the published grid is less than 5 h old (uses API calls)'
+        type: boolean
+        default: false
+      only_ecmwf:
+        description: 'Only refresh the ECMWF 9 km files (no Open-Meteo API calls)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Whole-run queue (incl. the deploy job): a second trigger (GitHub schedule + Worker backup) waits
+# until the first has PUBLISHED, then its freshness check skips it -> never double-spends calls.
+concurrency:
+  group: meteo-extract
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  SITE: https://avengingab1.github.io/houston-sky-data
+
+jobs:
+  extract-meteo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      skip: ${{ steps.fresh.outputs.skip }}
+    steps:
+      - name: Skip if the published grid is still fresh (saves API calls)
+        id: fresh
+        env:
+          FORCE: ${{ inputs.force || inputs.only_ecmwf }}
+        run: |
+          if [ "$FORCE" = "true" ]; then echo "skip=false" >> "$GITHUB_OUTPUT"; echo "forced run"; exit 0; fi
+          AGE_H=$(curl -sf "$SITE/meteo_latest.json" | python3 -c "import sys,json,datetime as d; g=json.load(sys.stdin)['generated']; t=d.datetime.strptime(g[:16],'%Y-%m-%dT%H:%M').replace(tzinfo=d.timezone.utc); print(int((d.datetime.now(d.timezone.utc)-t).total_seconds()//3600))" 2>/dev/null || echo 999)
+          echo "published grid age: ${AGE_H} h"
+          if [ "$AGE_H" -lt 5 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "still fresh: skipping (no API calls)"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v5
+        if: steps.fresh.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v6
+        if: steps.fresh.outputs.skip != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.fresh.outputs.skip != 'true'
+        run: pip install requests
+
+      # Non-fatal: a failure keeps the published meteo_latest.json and ECMWF still publishes.
+      - name: Extract Open-Meteo cloud + fog grid (once a day, before 12 UTC, or forced)
+        if: steps.fresh.outputs.skip != 'true' && inputs.only_ecmwf != true
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          if [ "$(date -u +%H)" -ge 12 ] && [ "${{ inputs.force }}" != "true" ]; then echo "afternoon run: ECMWF only (Open-Meteo budget)"; exit 0; fi
+          (cd extract && python extract_meteo.py --out ../out/meteo_latest.json)
+          ls -lh out
+
+      # ECMWF IFS 9 km long range (clouds, visibility, wind, precip to +15 days) from Open-Meteo's
+      # open S3 bucket: no API calls. Optional: a failure keeps the published ECMWF files.
+      - name: Extract ECMWF 9 km long-range grid + wind/precip overlays
+        if: steps.fresh.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          pip install omfiles fsspec s3fs numpy scipy Pillow
+          mkdir -p out
+          (cd extract && python extract_ecmwf.py --region houston --out ../out/ecmwf_latest.json --elements-out ../out/ecmwf_elements_latest.json)
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        if: steps.fresh.outputs.skip != 'true'
+        with:
+          name: meteo
+          path: out/*.json
+          retention-days: 1
+
+  deploy:
+    needs: extract-meteo
+    if: needs.extract-meteo.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Shared with hrrr.yml and NOT cancelling: Pages deploys queue one after another.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: meteo
+          path: _site
+
+      # Every deploy replaces the whole site: copy every feed file this run did not produce
+      # from the live site (single list for all workflows of this repo).
+      - name: Preserve the other feed files from the current deploy
+        run: |
+          touch _site/.nojekyll
+          for f in hrrr_latest.json elements_latest.json stations.json stations_peaks.json stations_grid.json meteo_latest.json ecmwf_latest.json ecmwf_elements_latest.json; do
+            if [ ! -f "_site/$f" ]; then
+              curl -sf "$SITE/$f" -o "_site/$f.tmp" && mv "_site/$f.tmp" "_site/$f" && echo "preserved $f" || { rm -f "_site/$f.tmp"; echo "no existing $f"; }
+            fi
+          done
+          ls -lh _site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      # GitHub's Pages API occasionally fails transiently ("Fetching artifact metadata failed",
+      # "Failed to create deployment (status: 500)") although the artifact is fine. Retry once
+      # after a minute instead of failing the run; the job only fails if the retry fails too.
+      - name: Wait before retrying a failed Pages deploy
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
+        uses: actions/deploy-pages@v4
