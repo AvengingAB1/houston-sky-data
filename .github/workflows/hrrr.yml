@@ -1,0 +1,121 @@
+name: HRRR cloud + wind/precip + stations data feed (Houston, dev)
+
+# Fast feed: NOAA HRRR 3 km low/mid/high cloud + visibility (numeric, GRIB2 byte ranges from the
+# AWS open-data bucket), wind/precip overlays rendered from the same HRRR fields, and Locationforecast
+# point forecasts for the app's places. The synoptic HRRR runs (00/06/12/18Z) reach +48 h and are
+# complete ~2 h after init. Hourly probe: if the newest COMPLETE run is already published, exit without
+# fetching or deploying. A manual run with force=true always does a full extract; a plain
+# dispatch (e.g. from the Cloudflare cron Worker) still respects the probe.
+
+on:
+  schedule:
+    - cron: '20 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-extract even if the newest HRRR run is already published'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Shared with meteo.yml and NOT cancelling: Pages deploys queue one after another, so each
+# deploy's "preserve" step always copies the files the previous deploy just published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  SITE: https://avengingab1.github.io/houston-sky-data
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r extract/requirements.txt
+
+      # Probe + extract in one step: extract_hrrr.py exits 3 (writes nothing) when the newest
+      # complete HRRR run equals the run already published. One pass writes clouds AND the overlays.
+      - name: Extract HRRR cloud grid + wind/precip overlays
+        id: clouds
+        run: |
+          mkdir -p _site
+          touch _site/.nojekyll
+          CURRENT_RUN=$(curl -sf "$SITE/hrrr_latest.json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('run',''))" 2>/dev/null || echo "")
+          echo "published run: '$CURRENT_RUN'"
+          SKIP_ARG=""
+          if [ "${{ inputs.force }}" != "true" ] && [ -n "$CURRENT_RUN" ]; then
+            SKIP_ARG="--skip-if-run $CURRENT_RUN"
+          fi
+          set +e
+          (cd extract && python extract_hrrr.py --out ../_site/hrrr_latest.json --elements-out ../_site/elements_latest.json $SKIP_ARG)
+          rc=$?
+          set -e
+          if [ $rc -eq 3 ]; then echo "skip=true" >> $GITHUB_OUTPUT; exit 0; fi
+          # 4 = the NOAA bucket is not answering: skip this cycle (published data stays).
+          if [ $rc -eq 4 ]; then echo "::warning::HRRR bucket unreachable - kept the published run"; echo "skip=true" >> $GITHUB_OUTPUT; exit 0; fi
+          if [ $rc -ne 0 ]; then exit $rc; fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+          ls -lh _site
+
+      # Keep the last ~30 h of PAST hours (newest run per hour) that the new run no longer covers.
+      - name: Carry recent past hours forward
+        if: steps.clouds.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          python extract/carry_forward.py --new _site/hrrr_latest.json --prev-url "$SITE/hrrr_latest.json" --hours 30
+          ls -lh _site
+
+      - name: Fetch Locationforecast station forecasts
+        if: steps.clouds.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          (cd extract && python extract_stations_metno.py --out ../_site/stations.json) || true
+          ls -lh _site
+
+      # Pages deploys REPLACE the whole site: copy back anything this run didn't produce.
+      - name: Preserve elements + stations + meteo from current deploy
+        if: steps.clouds.outputs.skip != 'true'
+        run: |
+          for f in hrrr_latest.json elements_latest.json stations.json stations_peaks.json stations_grid.json meteo_latest.json ecmwf_latest.json ecmwf_elements_latest.json; do
+            if [ ! -f "_site/$f" ]; then
+              curl -sf "$SITE/$f" -o "_site/$f.tmp" && mv "_site/$f.tmp" "_site/$f" && echo "preserved $f" || { rm -f "_site/$f.tmp"; echo "no existing $f"; }
+            fi
+          done
+          ls -lh _site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.clouds.outputs.skip != 'true'
+        with:
+          path: _site
+
+      - id: deployment
+        if: steps.clouds.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      # GitHub's Pages API occasionally fails transiently ("Fetching artifact metadata failed",
+      # "Failed to create deployment (status: 500)") although the artifact is fine. Retry once
+      # after a minute instead of failing the run; the job only fails if the retry fails too.
+      - name: Wait before retrying a failed Pages deploy
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
+        uses: actions/deploy-pages@v4
